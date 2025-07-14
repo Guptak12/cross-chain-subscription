@@ -3,15 +3,37 @@ pragma solidity ^0.8.24;
 
 import {ISubscriptionToken} from "./Interfaces/ISubscriptionToken.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {AutomationCompatibleInterface} from
+    "@chainlink/contracts/src/v0.8/automation/interfaces/AutomationCompatibleInterface.sol";
+import {CrossChainManager} from "./CrossChainManager.sol";
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
-import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
-contract SubscriptionManager is Ownable, AccessControl {
+contract SubscriptionManager is Ownable, AccessControl, AutomationCompatibleInterface {
     ISubscriptionToken private immutable i_subscriptionToken;
+    CrossChainManager private crossChainManager;
+
     mapping(address => mapping(string => Subscription)) private subscriptionRecord;
-    mapping(string => Subscription) private subscribingCompanies;
-    bytes32 private constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
-    bytes32 private constant COMPANY_ROLE = keccak256("COMPANY_ROLE");
+    mapping(address => bool) private isKnownUser;
+
+    mapping(string => CompanySubscription) private subscribingCompanies;
+    address[] private companyAddresses;
+    string[] private companyNames;
+    address[] private userAddresses;
+
+    bytes32 private constant USER_ROLE = keccak256("USER_ROLE");
+    bytes32 private constant CCIP_ROLE = keccak256("CCIP_ROLE");
+
+    enum UpkeepAction {
+        RENEW,
+        CANCEL
+    }
+
+    struct CompanySubscription {
+        string name;
+        address subscriptionAddress;
+        uint256 price;
+        uint256 chainID;
+    }
 
     struct Subscription {
         string name;
@@ -19,108 +41,245 @@ contract SubscriptionManager is Ownable, AccessControl {
         uint256 price;
         uint256 interval;
         uint256 startTime;
+        uint256 chainID;
         bool isActive;
     }
 
-    event Deposit(address indexed user, uint256 amount);
-    event Withdrawal(address indexed user, uint256 amount);
-    event SubscriptionPayed(string name, uint256 pricePayed, address subscriptionAddress, uint256 startTime);
-    event SubscriptionUpdated(string name, address subscriptionAddress, uint256 interval, uint256 price);
-    event SubscriptionCancelled(string name);
+    struct DueSubscription {
+        address user;
+        string companyName;
+        UpkeepAction action;
+    }
 
-    error SubscriptionManager__DepositAmountZero();
-    error SubscriptionManager__WithdrawalFailed();
-    error SubscriptionManager__WithdrawAmountZero();
+    event SubscriptionPaid(string name, uint256 pricePaid, address subscriptionAddress, uint256 startTime);
+    event SubscriptionUpdated(string name, address subscriptionAddress, uint256 price);
+    event SubscriptionCancelled(string name, address user);
+
     error SubscriptionManager__InvalidInput();
     error SubscriptionManager__SubscriptionAlreadyExists();
     error SubscriptionManager__SubscriptionInactive();
+    error SubscriptionManager__SubscriptionIsActive();
 
-    AggregatorV3Interface private immutable i_priceFeed;
+    address[] private receivers; // 0 -> sepolia, 1 -> avalanche
 
-    constructor(ISubscriptionToken subscriptionTokenAddress, address priceFeed) Ownable(msg.sender) {
+    constructor(ISubscriptionToken subscriptionTokenAddress) Ownable(msg.sender) {
         i_subscriptionToken = subscriptionTokenAddress;
-        i_priceFeed = AggregatorV3Interface(priceFeed);
+    }
+
+    function setReceivers(address[2] memory _receivers) external onlyOwner {
+        receivers = _receivers;
+    }
+
+    function setCrossChainManager(CrossChainManager crossChainManagerAddress) external onlyOwner {
+        crossChainManager = crossChainManagerAddress;
     }
 
     receive() external payable {
         // Handle incoming Ether deposits
     }
 
-    function grantCompanyRole(address company) external onlyOwner {
-        _grantRole(COMPANY_ROLE, company);
+    function grantCCIPRole(address crossChainExecutor) external onlyOwner {
+        _grantRole(CCIP_ROLE, crossChainExecutor);
     }
 
-    function depositTokens() external payable {
-        if (msg.value == 0) revert SubscriptionManager__DepositAmountZero();
-        uint256 usdAmount = getPriceInUsd(msg.value);
-        i_subscriptionToken.mint(msg.sender, usdAmount);
-        emit Deposit(msg.sender, usdAmount);
-    }
-
-    function withdrawTokens(uint256 amount) external {
-        if (amount <= 0) revert SubscriptionManager__WithdrawAmountZero();
-
-        if (amount == type(uint256).max) {
-            amount = i_subscriptionToken.balanceOf(msg.sender);
+    function grantUserRole(address user) external onlyOwner {
+        if (!isKnownUser[user]) {
+            userAddresses.push(user);
+            isKnownUser[user] = true;
         }
-        i_subscriptionToken.burn(msg.sender, getPriceInUsd(amount));
 
-        (bool success,) = msg.sender.call{value: amount}("");
-        if (!success) {
-            revert SubscriptionManager__WithdrawalFailed();
-        }
-        emit Withdrawal(msg.sender, amount);
+        _grantRole(USER_ROLE, user);
     }
 
-    /// @param price Price in USD tokens (18 decimals). Example: $10 => 10 * 1e18
+    function createSubscription(string memory name, uint256 price) external {
+        if (!_stringExists(companyNames, name)) {
+            subscribingCompanies[name] =
+                CompanySubscription({name: name, subscriptionAddress: msg.sender, price: price, chainID: block.chainid});
+            companyNames.push(name);
+        }
+    }
 
-    function createSubscription(string memory name, address _address, uint256 _interval, uint256 price)
+    function enrollSubscription(
+        string memory name,
+        uint256 interval,
+        address subscriptionAddress,
+        uint256 price,
+        uint256 chainID,
+        address receiver
+    ) external onlyRole(USER_ROLE) {
+        _enrollSubscription(name, interval, subscriptionAddress, price, chainID, receiver);
+    }
+
+    function paySubscription(string memory name, address user, address receiver) public {
+        _paySubscription(name, user, receiver);
+    }
+
+    function paySubscriptionWhenReceived(string memory name, address company, uint256 price)
         external
-        onlyRole(COMPANY_ROLE)
+        onlyRole(CCIP_ROLE)
     {
-        if (bytes(name).length == 0 || _address == address(0)) {
-            revert SubscriptionManager__InvalidInput();
-        }
-        if (subscribingCompanies[name].subscriptionAddress != address(0)) {
-            revert SubscriptionManager__SubscriptionAlreadyExists();
-        }
-
-        subscribingCompanies[name] = Subscription({
-            name: name,
-            subscriptionAddress: _address,
-            interval: _interval,
-            price: price,
-            startTime: block.timestamp,
-            isActive: true
-        });
+        i_subscriptionToken.mint(company, price);
+        emit SubscriptionPaid(name, price, company, block.timestamp);
     }
 
-    function enrollSubscription(string memory name) external {
+    function cancelSubscriptionWhenReceived(string memory name, address user) external onlyRole(CCIP_ROLE) {
+        emit SubscriptionCancelled(name, user);
+    }
+
+    function cancelSubscription(string memory name, address user, address receiver) public {
+        if (_checkIfSubscriptionIsOnDifferentChain(user, name)) {
+            address[] memory users = new address[](1);
+            users[0] = user;
+            crossChainManager.sendMessage(
+                CrossChainManager.Action.CANCEL,
+                name,
+                users,
+                _getChainSelector(subscriptionRecord[user][name].chainID),
+                receiver
+            );
+            subscriptionRecord[user][name].isActive = false;
+            emit SubscriptionCancelled(name, user);
+        } else {
+            _cancelSubscription(name, user);
+        }
+    }
+
+    // function updateCompanySubscription(string memory name, address _address, uint256 price)
+    //     external
+    //     onlyRole(COMPANY_ROLE)
+    // {
+    //     if (bytes(name).length == 0) {
+    //         revert SubscriptionManager__InvalidInput();
+    //     }
+    //     CompanySubscription storage companySubscription = subscribingCompanies[name];
+
+    //     companySubscription.subscriptionAddress = _address;
+    //     companySubscription.price = price;
+    //     emit SubscriptionUpdated(name, _address, price);
+    // }
+
+    function checkUpkeep(bytes calldata /* checkData */ )
+        external
+        view
+        override
+        returns (bool upkeepNeeded, bytes memory performData)
+    {
+        (upkeepNeeded, performData) = _checkSubscriptionUpkeep();
+    }
+
+    function performUpkeep(bytes calldata performData) external override {
+        _performSubscriptionUpkeep(performData);
+    }
+
+    function _checkSubscriptionUpkeep() internal view returns (bool upkeepNeeded, bytes memory performData) {
+        DueSubscription[] memory dueList = new DueSubscription[](userAddresses.length * companyNames.length);
+        uint256 count = 0;
+        for (uint256 i = 0; i < userAddresses.length; i++) {
+            address user = userAddresses[i];
+            for (uint256 j = 0; j < companyNames.length; j++) {
+                string memory companyName = companyNames[j];
+                Subscription storage subscription = subscriptionRecord[user][companyName];
+                if (subscription.isActive && block.timestamp >= subscription.startTime + subscription.interval) {
+                    if (i_subscriptionToken.balanceOf(user) >= subscription.price) {
+                        dueList[count] =
+                            DueSubscription({user: user, companyName: companyName, action: UpkeepAction.RENEW});
+                        count++;
+                    } else {
+                        dueList[count] =
+                            DueSubscription({user: user, companyName: companyName, action: UpkeepAction.CANCEL});
+                        count++;
+                    }
+                }
+            }
+        }
+
+        if (count > 0) {
+            upkeepNeeded = true;
+            DueSubscription[] memory result = new DueSubscription[](count);
+            for (uint256 k = 0; k < count; k++) {
+                result[k] = dueList[k];
+            }
+            performData = abi.encode(result);
+        } else {
+            upkeepNeeded = false;
+            performData = "";
+        }
+        return (upkeepNeeded, performData);
+    }
+
+    function _performSubscriptionUpkeep(bytes memory performData) internal {
+        DueSubscription[] memory dueList = abi.decode(performData, (DueSubscription[]));
+        for (uint256 i = 0; i < dueList.length; i++) {
+            DueSubscription memory task = dueList[i];
+            if (task.action == UpkeepAction.RENEW) {
+                paySubscription(
+                    task.companyName, task.user, _getReceiver(subscriptionRecord[task.user][task.companyName].chainID)
+                );
+            } else if (task.action == UpkeepAction.CANCEL) {
+                cancelSubscription(
+                    task.companyName, task.user, _getReceiver(subscriptionRecord[task.user][task.companyName].chainID)
+                );
+            }
+        }
+    }
+
+    function _enrollSubscription(
+        string memory name,
+        uint256 interval,
+        address subscriptionAddress,
+        uint256 price,
+        uint256 chainID,
+        address receiver
+    ) internal onlyRole(USER_ROLE) {
         if (bytes(name).length == 0) {
             revert SubscriptionManager__InvalidInput();
         }
-        Subscription storage subscription = subscribingCompanies[name];
-        if (subscription.subscriptionAddress == address(0)) {
+        if (subscriptionAddress == address(0)) {
             revert SubscriptionManager__SubscriptionInactive();
         }
-        i_subscriptionToken.transferFrom(msg.sender, subscription.subscriptionAddress, subscription.price);
-
-        emit SubscriptionPayed(name, subscription.price, subscription.subscriptionAddress, subscription.startTime);
 
         subscriptionRecord[msg.sender][name] = Subscription({
             name: name,
-            subscriptionAddress: subscription.subscriptionAddress,
-            interval: subscription.interval,
-            price: subscribingCompanies[name].price,
-            startTime: block.timestamp,
+            subscriptionAddress: subscriptionAddress,
+            interval: interval,
+            price: price,
+            startTime: 0,
+            chainID: chainID,
             isActive: true
         });
+        if (!_stringExists(companyNames, name)) {
+            subscribingCompanies[name] = CompanySubscription({
+                name: name,
+                subscriptionAddress: subscriptionAddress,
+                price: price,
+                chainID: chainID
+            });
+            companyNames.push(name);
+        }
+        _paySubscription(name, msg.sender, receiver);
     }
-    // function subscribe(string memory name, uint256 interval) external{
-    //     i_subscriptionToken.super.allowance()
-    // }
 
-    function paySubscription(string memory name, address user) external {
+    function _getChainSelector(uint256 chainID) internal pure returns (uint64) {
+        if (chainID == 11155111) {
+            return 16015286601757825753; // Sepolia
+        } else if (chainID == 43113) {
+            return 14767482510784806043; // Avalanche
+        } else {
+            return 0; // Local Anvil or other networks
+        }
+    }
+
+    function _getReceiver(uint256 chainID) internal view returns (address) {
+        if (chainID == 11155111) {
+            return receivers[0]; // Sepolia
+        } else if (chainID == 43113) {
+            return receivers[1]; // Avalanche
+        } else {
+            return address(0); // Local Anvil or other networks
+        }
+    }
+
+    function _paySubscription(string memory name, address user, address receiver) internal {
         if (bytes(name).length == 0) {
             revert SubscriptionManager__InvalidInput();
         }
@@ -128,53 +287,82 @@ contract SubscriptionManager is Ownable, AccessControl {
         if (!subscription.isActive) {
             revert SubscriptionManager__SubscriptionInactive();
         }
+        if (subscription.startTime == 0 || block.timestamp >= subscription.startTime + subscription.interval) {
+            if (_checkIfSubscriptionIsOnDifferentChain(user, name)) {
+                address[] memory users = new address[](1);
+                users[0] = user;
+                crossChainManager.sendMessage(
+                    CrossChainManager.Action.PAY,
+                    name,
+                    users,
+                    _getChainSelector(subscriptionRecord[user][name].chainID),
+                    receiver
+                );
+                i_subscriptionToken.burn(user, subscriptionRecord[user][name].price);
+                emit SubscriptionPaid(
+                    name,
+                    subscriptionRecord[user][name].price,
+                    subscriptionRecord[user][name].subscriptionAddress,
+                    block.timestamp
+                );
+                subscriptionRecord[user][name].startTime = block.timestamp;
+                subscriptionRecord[user][name].isActive = true;
+            } else {
+                // i_subscriptionToken.transfer(subscription.subscriptionAddress, subscription.price);
+                i_subscriptionToken.transferFrom(user, subscription.subscriptionAddress, subscription.price);
 
-        if (block.timestamp >= subscription.startTime + subscription.interval) {
-            // i_subscriptionToken.transfer(subscription.subscriptionAddress, subscription.price);
-        i_subscriptionToken.transferFrom(user, subscription.subscriptionAddress, subscription.price);
-
-            subscription.startTime = block.timestamp;
-            emit SubscriptionPayed(name, subscription.price, subscription.subscriptionAddress, subscription.startTime);
+                subscription.startTime = block.timestamp;
+                emit SubscriptionPaid(
+                    name, subscription.price, subscription.subscriptionAddress, subscription.startTime
+                );
+            }
+        } else {
+            revert SubscriptionManager__SubscriptionIsActive();
         }
     }
 
-    function cancelSubscription(string memory name) external {
-        if (bytes(name).length == 0) {
-            revert SubscriptionManager__InvalidInput();
-        }
-        Subscription storage subscription = subscriptionRecord[msg.sender][name];
+    function _cancelSubscription(string memory name, address user) internal {
+        Subscription storage subscription = subscriptionRecord[user][name];
+        if (!subscription.isActive) return; // Already canceled, skip
+
         subscription.isActive = false;
-        emit SubscriptionCancelled(name);
+        emit SubscriptionCancelled(name, user);
     }
 
-    function updateCompanySubscription(string memory name, address _address, uint256 _interval, uint256 price)
-        external
-        onlyRole(COMPANY_ROLE)
-    {
-        if (bytes(name).length == 0) {
-            revert SubscriptionManager__InvalidInput();
-        }
-        Subscription storage subscription = subscribingCompanies[name];
-
-        subscription.subscriptionAddress = _address;
-        subscription.interval = _interval;
-        subscription.price = price;
-        emit SubscriptionUpdated(name, _address, _interval, price);
-    }
-
-    function getPriceInUsd(uint256 amount) public view returns (uint256) {
-        uint256 ethUsdPrice = getEthUsdPrice();
-        return (amount * ethUsdPrice) / 1e8; // Assuming amount is in wei, ethUsdPrice is in 8 decimals, / 1e18*1e8
-    }
-
-    function getEthUsdPrice() public view returns (uint256) {
-        (, int256 price,,,) = i_priceFeed.latestRoundData();
-        return uint256(price);
-    }
-
-    function getComapanySubscription(string memory name) external view returns (Subscription memory) {
+    function getCompanySubscription(string memory name) public view returns (CompanySubscription memory) {
         return subscribingCompanies[name];
     }
+
+    function _checkIfSubscriptionIsOnDifferentChain(address user, string memory name) internal view returns (bool) {
+        Subscription storage subscription = subscriptionRecord[user][name];
+        if (subscription.chainID != block.chainid) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    function _addressExists(address[] storage addresses, address addr) internal view returns (bool) {
+        for (uint256 i = 0; i < addresses.length; i++) {
+            if (addresses[i] == addr) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function _stringExists(string[] storage list, string memory str) internal view returns (bool) {
+        for (uint256 i = 0; i < list.length; i++) {
+            if (keccak256(bytes(list[i])) == keccak256(bytes(str))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // function getCompanySubscription(string memory name) external view returns (CompanySubscription memory) {
+    //     return subscribingCompanies[name];
+    // }
 
     function getUserSubscription(string memory name, address user) external view returns (Subscription memory) {
         return subscriptionRecord[user][name];
@@ -186,6 +374,10 @@ contract SubscriptionManager is Ownable, AccessControl {
 
     function getSubscriptionStatus(string memory name, address user) external view returns (bool) {
         return subscriptionRecord[user][name].isActive;
+    }
+
+    function getSubscriptionChainID(string memory name, address user) external view returns (uint256) {
+        return subscriptionRecord[user][name].chainID;
     }
 
     function getSubscriptionCurrentPrice(string memory name, address user) external view returns (uint256) {
